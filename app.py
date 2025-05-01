@@ -270,16 +270,16 @@ INDEX_HTML = """
           <p class="method-description">Best for natural images with fine details.</p>
           
           <div class="radio-option">
-            <input type="radio" id="tvl1" name="method" value="tvl1">
-            <label for="tvl1">TV-L1 Denoising</label>
-          </div>
-          <p class="method-description">Preserves edges while removing noise.</p>
-          
-          <div class="radio-option">
             <input type="radio" id="bilateral" name="method" value="bilateral">
             <label for="bilateral">Bilateral Filter</label>
           </div>
           <p class="method-description">Smooths while preserving edges and textures.</p>
+          
+          <div class="radio-option">
+            <input type="radio" id="gaussian" name="method" value="gaussian">
+            <label for="gaussian">Gaussian Filter</label>
+          </div>
+          <p class="method-description">Simple smoothing for uniform noise.</p>
         </div>
         
         <div class="checkbox-container">
@@ -394,7 +394,7 @@ def denoise_image(input_path, output_path, strength=5, method="nlmeans", graysca
     - input_path: Path to the input image
     - output_path: Path to save the processed image
     - strength: Denoising strength (1-10)
-    - method: Denoising method to use (nlmeans, tvl1, bilateral)
+    - method: Denoising method to use (nlmeans, bilateral, gaussian)
     - grayscale: Whether to convert to grayscale
     """
     try:
@@ -439,28 +439,7 @@ def denoise_image(input_path, output_path, strength=5, method="nlmeans", graysca
                     search_window
                 )
                 
-        elif method == "tvl1":
-            # TV-L1 denoising (Total Variation L1)
-            # Convert to float32 for processing
-            img_float = image.astype(np.float32) / 255.0
-            
-            # Lambda parameter controls denoising strength
-            lambda_val = 1.0 - (scaled_strength * 0.8)  # Invert so higher strength = more denoising
-            
-            # Apply TV-L1 to each channel separately
-            if len(img_float.shape) == 3:
-                denoised_channels = []
-                for c in range(3):
-                    denoised_channel = cv2.denoise_TVL1(img_float[:,:,c], lambda_val)
-                    denoised_channels.append(denoised_channel)
-                denoised_float = np.stack(denoised_channels, axis=2)
-            else:
-                denoised_float = cv2.denoise_TVL1(img_float, lambda_val)
-            
-            # Convert back to uint8
-            denoised = np.clip(denoised_float * 255.0, 0, 255).astype(np.uint8)
-            
-        else:  # bilateral
+        elif method == "bilateral":
             # Bilateral Filter
             # Parameters: d (diameter), sigmaColor, sigmaSpace
             d = 7  # Fixed diameter of pixel neighborhood
@@ -468,6 +447,18 @@ def denoise_image(input_path, output_path, strength=5, method="nlmeans", graysca
             sigma_space = 10 + (40 * scaled_strength)  # Range 10-50
             
             denoised = cv2.bilateralFilter(image, d, sigma_color, sigma_space)
+            
+        else:  # gaussian
+            # Simple Gaussian blur
+            # Parameters: ksize (kernel size), sigmaX
+            kernel_size = int(3 + (scaled_strength * 4))  # Range from 3x3 to 7x7
+            # Make sure kernel size is odd
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+                
+            sigma = 0.3 + (scaled_strength * 1.7)  # Range from 0.3 to 2.0
+            
+            denoised = cv2.GaussianBlur(image, (kernel_size, kernel_size), sigma)
         
         # Save the processed image
         cv2.imwrite(output_path, denoised)
@@ -534,5 +525,13 @@ def download_file(filename):
     """Download processed files as attachments"""
     return send_from_directory(app.config['PROCESSED_FOLDER'], filename, as_attachment=True)
 
+# Add a simple health check endpoint
+@app.route('/health')
+def health_check():
+    return "OK", 200
+
+# Add a port binding that works with Render
+port = int(os.environ.get("PORT", 5000))
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=port)
