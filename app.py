@@ -1,12 +1,13 @@
 import os
 import cv2
 import numpy as np
-from flask import Flask, request, send_from_directory, render_template_string, url_for, redirect
+from flask import Flask, request, send_from_directory, render_template_string, url_for, redirect, jsonify
 from werkzeug.utils import secure_filename
 import time
 from threading import Thread
 from queue import Queue
 import logging
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -404,7 +405,6 @@ PROCESSING_HTML = """
 <head>
     <title>Processing Image</title>
     <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="3;url={{ url_for('check_status', job_id=job_id) }}">
     <style>{{ css }}</style>
 </head>
 <body>
@@ -415,17 +415,43 @@ PROCESSING_HTML = """
             <div class="spinner"></div> Processing...
         </div>
         
-        <p>Your image is being processed. This page will automatically refresh.</p>
+        <p>Your image is being processed. Please wait a moment.</p>
         <p>Job ID: {{ job_id }}</p>
         
-        <a href="{{ url_for('check_status', job_id=job_id) }}" class="button">Check Status Manually</a>
+        <a href="#" id="check-status-btn" class="button">Check Status Manually</a>
     </div>
     
     <script>
-        // Refresh the page every 3 seconds to check status
-        setTimeout(function() {
-            window.location.href = "{{ url_for('check_status', job_id=job_id) }}";
-        }, 3000);
+        // Polling for status instead of page refresh
+        const jobId = "{{ job_id }}";
+        const statusBtn = document.getElementById('check-status-btn');
+        
+        // Set up polling interval (check every 2 seconds)
+        const statusInterval = setInterval(checkJobStatus, 2000);
+        
+        // Manual status check
+        statusBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            checkJobStatus();
+        });
+        
+        function checkJobStatus() {
+            fetch('/api/status/' + jobId)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'completed') {
+                        clearInterval(statusInterval);
+                        window.location.href = "/status/" + jobId;
+                    } else if (data.status === 'failed') {
+                        clearInterval(statusInterval);
+                        window.location.href = "/status/" + jobId;
+                    }
+                    // For pending or processing, just keep polling
+                })
+                .catch(error => {
+                    console.error('Error checking status:', error);
+                });
+        }
     </script>
 </body>
 </html>
@@ -513,7 +539,7 @@ ERROR_HTML = """
 # ========== IMAGE PROCESSING ==========
 def denoise_image(input_path, output_path, strength=5, method="nlmeans", grayscale=False):
     """
-    Apply denoising filters to the image
+    Apply denoising filters to the image - OPTIMIZED VERSION
     
     Parameters:
     - input_path: Path to the input image
@@ -533,22 +559,22 @@ def denoise_image(input_path, output_path, strength=5, method="nlmeans", graysca
         if image is None:
             raise ValueError(f"Failed to load image from {input_path}")
         
-        # Resize large images to prevent timeouts
-        max_dimension = 1500  # Maximum width or height
+        # Resize large images to prevent timeouts - REDUCED MAX SIZE FOR FASTER PROCESSING
+        max_dimension = 1000  # Reduced from 1500 to 1000 for faster processing
         height, width = image.shape[:2]
         
-        # If image is too large, resize it
+        # If image is too large, resize it more aggressively
         if width > max_dimension or height > max_dimension:
             # Calculate scaling factor
             scale = min(max_dimension / width, max_dimension / height)
             new_width = int(width * scale)
             new_height = int(height * scale)
             
-            # Resize the image
+            # Resize the image using INTER_AREA for downsampling (better quality)
             image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
             logger.info(f"Resized image from {width}x{height} to {new_width}x{new_height}")
         
-        # Convert to grayscale if requested
+        # Convert to grayscale if requested - do this early to speed up processing
         if grayscale:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             # Convert back to BGR so we can save as color (but still grayscale)
@@ -557,19 +583,19 @@ def denoise_image(input_path, output_path, strength=5, method="nlmeans", graysca
         # Scale strength parameter for different methods
         scaled_strength = strength / 10.0  # Convert to 0-1 range
         
-        # Apply denoising based on selected method
+        # Apply denoising based on selected method - OPTIMIZED PARAMETERS
         if method == "nlmeans":
-            # Non-Local Means Denoising - Optimize parameters for better performance
-            h_luminance = 3 + (10 * scaled_strength)  # Scale between 3-13 based on strength
-            search_window = 15  # Reduced from 21 to improve performance
-            template_window = 7
+            # Non-Local Means Denoising - Further optimized parameters
+            h_luminance = 3 + (7 * scaled_strength)  # Reduced from 10 to 7 to speed up
+            search_window = 11  # Reduced from 15 to 11 to improve performance
+            template_window = 5  # Reduced from 7 to 5
             
             if len(image.shape) == 3:  # Color image
                 denoised = cv2.fastNlMeansDenoisingColored(
                     image, 
                     None, 
-                    h_luminance,  # Luminance component filter strength
-                    h_luminance,  # Color component filter strength
+                    h_luminance,
+                    h_luminance,
                     template_window, 
                     search_window
                 )
@@ -583,28 +609,35 @@ def denoise_image(input_path, output_path, strength=5, method="nlmeans", graysca
                 )
                 
         elif method == "bilateral":
-            # Bilateral Filter
-            # Parameters: d (diameter), sigmaColor, sigmaSpace
-            d = 7  # Fixed diameter of pixel neighborhood
-            sigma_color = 10 + (40 * scaled_strength)  # Range 10-50
-            sigma_space = 10 + (40 * scaled_strength)  # Range 10-50
+            # Bilateral Filter - Optimized parameters
+            d = 5  # Reduced from 7 to 5 for faster processing
+            sigma_color = 10 + (30 * scaled_strength)  # Range 10-40 instead of 10-50
+            sigma_space = 10 + (30 * scaled_strength)  # Range 10-40 instead of 10-50
             
             denoised = cv2.bilateralFilter(image, d, sigma_color, sigma_space)
             
         else:  # gaussian
-            # Simple Gaussian blur
-            # Parameters: ksize (kernel size), sigmaX
-            kernel_size = int(3 + (scaled_strength * 4))  # Range from 3x3 to 7x7
+            # Simple Gaussian blur - Fastest option
+            kernel_size = int(3 + (scaled_strength * 2))  # Reduced range from 3-7 to 3-5
             # Make sure kernel size is odd
             if kernel_size % 2 == 0:
                 kernel_size += 1
                 
-            sigma = 0.3 + (scaled_strength * 1.7)  # Range from 0.3 to 2.0
+            sigma = 0.3 + (scaled_strength * 1.2)  # Reduced range
             
             denoised = cv2.GaussianBlur(image, (kernel_size, kernel_size), sigma)
         
-        # Save the processed image
-        cv2.imwrite(output_path, denoised)
+        # Save the processed image with optimized compression
+        if output_path.lower().endswith('.jpg') or output_path.lower().endswith('.jpeg'):
+            # For JPEG, set quality to 95
+            cv2.imwrite(output_path, denoised, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        elif output_path.lower().endswith('.png'):
+            # For PNG, set compression level to 3 (0-9, where 9 is max compression but slow)
+            cv2.imwrite(output_path, denoised, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+        else:
+            # For other formats, use default parameters
+            cv2.imwrite(output_path, denoised)
+            
         return True, "Processing completed successfully"
         
     except Exception as e:
@@ -612,7 +645,7 @@ def denoise_image(input_path, output_path, strength=5, method="nlmeans", graysca
         logger.error(error_msg)
         return False, error_msg
 
-# Background worker thread to process images
+# Background worker thread to process images - IMPROVED VERSION
 def process_image_queue():
     while True:
         try:
@@ -621,6 +654,7 @@ def process_image_queue():
             
             # Update job status
             processing_jobs[job_id]['status'] = 'processing'
+            start_time = time.time()
             
             # Process the image
             success, message = denoise_image(
@@ -631,9 +665,14 @@ def process_image_queue():
                 grayscale=params.get('grayscale', False)
             )
             
+            # Calculate processing time
+            process_time = time.time() - start_time
+            logger.info(f"Job {job_id} completed in {process_time:.2f} seconds")
+            
             # Update job status
             if success:
                 processing_jobs[job_id]['status'] = 'completed'
+                processing_jobs[job_id]['process_time'] = f"{process_time:.2f} seconds"
             else:
                 processing_jobs[job_id]['status'] = 'failed'
                 processing_jobs[job_id]['error'] = message
@@ -674,6 +713,11 @@ def index():
             try:
                 # Secure the filename to prevent directory traversal attacks
                 filename = secure_filename(file.filename)
+                
+                # Add timestamp to filename to prevent overwrites
+                name, ext = os.path.splitext(filename)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{name}_{timestamp}{ext}"
                 
                 # Check if the file is an image
                 if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff')):
@@ -724,6 +768,19 @@ def index():
     # Render the index page for GET requests
     return render_template_string(INDEX_HTML, css=CSS_STYLE)
 
+# NEW API endpoint for status checking via AJAX
+@app.route('/api/status/<job_id>')
+def api_status(job_id):
+    if job_id not in processing_jobs:
+        return jsonify({'status': 'not_found', 'message': 'Job not found'})
+    
+    job = processing_jobs[job_id]
+    return jsonify({
+        'status': job['status'],
+        'message': job.get('error', '') if job['status'] == 'failed' else '',
+        'process_time': job.get('process_time', '')
+    })
+
 @app.route('/status/<job_id>')
 def check_status(job_id):
     if job_id not in processing_jobs:
@@ -759,36 +816,72 @@ def processed_file(filename):
 
 @app.route('/download/<filename>')
 def download_file(filename):
-    """Download processed files as attachments"""
-    return send_from_directory(app.config['PROCESSED_FOLDER'], filename, as_attachment=True)
+    """Download processed file with proper headers"""
+    return send_from_directory(
+        app.config['PROCESSED_FOLDER'], 
+        filename, 
+        as_attachment=True,
+        download_name=f"denoised_{filename}"
+    )
 
-# Add a simple health check endpoint
-@app.route('/health')
-def health_check():
-    return "OK", 200
-
-# Add a cleanup job to remove old processing jobs
+# Clean up old jobs periodically
 def cleanup_old_jobs():
+    """Remove jobs older than 24 hours to prevent memory leaks"""
     current_time = time.time()
-    to_remove = []
+    jobs_to_remove = []
     
-    for job_id, job in processing_jobs.items():
-        # Remove jobs older than 1 hour
-        if current_time - job['created_at'] > 3600:
-            to_remove.append(job_id)
+    for job_id, job_data in processing_jobs.items():
+        # If job is older than 24 hours (86400 seconds)
+        if current_time - job_data.get('created_at', 0) > 86400:
+            jobs_to_remove.append(job_id)
     
-    for job_id in to_remove:
+    # Remove old jobs
+    for job_id in jobs_to_remove:
         processing_jobs.pop(job_id, None)
+        logger.info(f"Cleaned up old job: {job_id}")
 
-# Cleanup old jobs every 10 minutes
-from apscheduler.schedulers.background import BackgroundScheduler
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=cleanup_old_jobs, trigger="interval", minutes=10)
-scheduler.start()
+# Start cleanup thread
+def run_cleanup():
+    while True:
+        try:
+            cleanup_old_jobs()
+        except Exception as e:
+            logger.error(f"Error in cleanup thread: {str(e)}")
+        # Sleep for 1 hour before next cleanup
+        time.sleep(3600)
 
-# Add a port binding that works with Render
-port = int(os.environ.get("PORT", 5000))
+cleanup_thread = Thread(target=run_cleanup, daemon=True)
+cleanup_thread.start()
 
+# Error handling
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    """Handle file too large error"""
+    return render_template_string(
+        INDEX_HTML, 
+        css=CSS_STYLE, 
+        error="File is too large. Maximum file size is 16MB."
+    )
+
+@app.errorhandler(404)
+def not_found(error):
+    """Handle 404 errors"""
+    return render_template_string(
+        ERROR_HTML, 
+        css=CSS_STYLE, 
+        error_message="The requested resource was not found."
+    )
+
+@app.errorhandler(500)
+def server_error(error):
+    """Handle 500 errors"""
+    return render_template_string(
+        ERROR_HTML, 
+        css=CSS_STYLE, 
+        error_message="An internal server error occurred. Please try again later."
+    )
+
+# Run the Flask app
 if __name__ == '__main__':
-    # Use Gunicorn for production
-    app.run(host='0.0.0.0', port=port)
+    # Set host to 0.0.0.0 to make it accessible from outside the container/VM
+    app.run(host='0.0.0.0', port=5000, debug=True)
