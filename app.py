@@ -3,16 +3,30 @@ import cv2
 import numpy as np
 from flask import Flask, request, send_from_directory, render_template_string, url_for, redirect
 from werkzeug.utils import secure_filename
+import time
+from threading import Thread
+from queue import Queue
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['PROCESSED_FOLDER'] = 'processed'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Limit uploads to 16MB
+app.config['PROCESSING_QUEUE'] = Queue()
 
 # Create directories if they don't exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['PROCESSED_FOLDER'], exist_ok=True)
 
-# ========== CSS ==========
+# Job status tracking
+processing_jobs = {}
+
+# CSS and HTML templates remain the same as in your original code
 CSS_STYLE = """
 body {
   font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -233,6 +247,53 @@ hr {
   text-align: left;
   padding-left: 25px;
 }
+.status-label {
+  padding: 8px 16px;
+  border-radius: 4px;
+  font-weight: bold;
+  margin: 10px 0;
+  display: inline-block;
+}
+.status-pending {
+  background-color: #FFF8E1;
+  color: #FFA000;
+}
+.status-processing {
+  background-color: #E3F2FD;
+  color: #1976D2;
+}
+.status-completed {
+  background-color: #E8F5E9;
+  color: #388E3C;
+}
+.status-failed {
+  background-color: #FFEBEE;
+  color: #D32F2F;
+}
+.spinner {
+  border: 4px solid rgba(0, 0, 0, 0.1);
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border-left-color: #4285f4;
+  animation: spin 1s linear infinite;
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 10px;
+}
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+.error-message {
+  color: #D32F2F;
+  background-color: #FFEBEE;
+  padding: 15px;
+  border-radius: 8px;
+  margin: 20px 0;
+  text-align: left;
+  font-weight: 500;
+}
 """
 
 # ========== INDEX HTML ==========
@@ -248,10 +309,13 @@ INDEX_HTML = """
 <body>
   <div class="container">
     <h1>🧹 Professional Image Denoiser</h1>
+    {% if error %}
+    <div class="error-message">{{ error }}</div>
+    {% endif %}
     <form id="upload-form" action="/" method="POST" enctype="multipart/form-data">
       <div class="upload-area" id="drop-area" onclick="document.getElementById('file-input').click()">
         <div class="upload-icon">📁</div>
-        <p>Click to select or drag and drop an image</p>
+        <p>Click to select or drag and drop an image (max 16MB)</p>
       </div>
       <input type="file" id="file-input" name="image" accept="image/*" required>
       <div class="control-panel">
@@ -333,6 +397,40 @@ INDEX_HTML = """
 </html>
 """
 
+# ========== PROCESSING HTML ==========
+PROCESSING_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Processing Image</title>
+    <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="3;url={{ url_for('check_status', job_id=job_id) }}">
+    <style>{{ css }}</style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔄 Processing Your Image</h1>
+        
+        <div class="status-label status-processing">
+            <div class="spinner"></div> Processing...
+        </div>
+        
+        <p>Your image is being processed. This page will automatically refresh.</p>
+        <p>Job ID: {{ job_id }}</p>
+        
+        <a href="{{ url_for('check_status', job_id=job_id) }}" class="button">Check Status Manually</a>
+    </div>
+    
+    <script>
+        // Refresh the page every 3 seconds to check status
+        setTimeout(function() {
+            window.location.href = "{{ url_for('check_status', job_id=job_id) }}";
+        }, 3000);
+    </script>
+</body>
+</html>
+"""
+
 # ========== RESULT HTML ==========
 RESULT_HTML = """
 <!DOCTYPE html>
@@ -385,6 +483,33 @@ RESULT_HTML = """
 </html>
 """
 
+# ========== ERROR HTML ==========
+ERROR_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Processing Error</title>
+    <meta charset="UTF-8">
+    <style>{{ css }}</style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚠️ Processing Error</h1>
+        
+        <div class="status-label status-failed">
+            Failed
+        </div>
+        
+        <div class="error-message">
+            {{ error_message }}
+        </div>
+        
+        <a href="{{ url_for('index') }}" class="button">Try Again</a>
+    </div>
+</body>
+</html>
+"""
+
 # ========== IMAGE PROCESSING ==========
 def denoise_image(input_path, output_path, strength=5, method="nlmeans", grayscale=False):
     """
@@ -398,11 +523,30 @@ def denoise_image(input_path, output_path, strength=5, method="nlmeans", graysca
     - grayscale: Whether to convert to grayscale
     """
     try:
+        # Check if input file exists
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+            
         # Read the image
         image = cv2.imread(input_path)
         
         if image is None:
             raise ValueError(f"Failed to load image from {input_path}")
+        
+        # Resize large images to prevent timeouts
+        max_dimension = 1500  # Maximum width or height
+        height, width = image.shape[:2]
+        
+        # If image is too large, resize it
+        if width > max_dimension or height > max_dimension:
+            # Calculate scaling factor
+            scale = min(max_dimension / width, max_dimension / height)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            
+            # Resize the image
+            image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            logger.info(f"Resized image from {width}x{height} to {new_width}x{new_height}")
         
         # Convert to grayscale if requested
         if grayscale:
@@ -415,10 +559,9 @@ def denoise_image(input_path, output_path, strength=5, method="nlmeans", graysca
         
         # Apply denoising based on selected method
         if method == "nlmeans":
-            # Non-Local Means Denoising
-            # Parameters: h (filter strength), templateWindowSize, searchWindowSize
+            # Non-Local Means Denoising - Optimize parameters for better performance
             h_luminance = 3 + (10 * scaled_strength)  # Scale between 3-13 based on strength
-            search_window = 21
+            search_window = 15  # Reduced from 21 to improve performance
             template_window = 7
             
             if len(image.shape) == 3:  # Color image
@@ -462,13 +605,55 @@ def denoise_image(input_path, output_path, strength=5, method="nlmeans", graysca
         
         # Save the processed image
         cv2.imwrite(output_path, denoised)
+        return True, "Processing completed successfully"
         
     except Exception as e:
-        print(f"Error processing image: {str(e)}")
-        # If processing fails, copy the original to the output
-        if os.path.exists(input_path):
-            import shutil
-            shutil.copy(input_path, output_path)
+        error_msg = f"Error processing image: {str(e)}"
+        logger.error(error_msg)
+        return False, error_msg
+
+# Background worker thread to process images
+def process_image_queue():
+    while True:
+        try:
+            # Get a job from the queue
+            job_id, input_path, output_path, params = app.config['PROCESSING_QUEUE'].get()
+            
+            # Update job status
+            processing_jobs[job_id]['status'] = 'processing'
+            
+            # Process the image
+            success, message = denoise_image(
+                input_path, 
+                output_path, 
+                strength=params.get('strength', 5),
+                method=params.get('method', 'nlmeans'),
+                grayscale=params.get('grayscale', False)
+            )
+            
+            # Update job status
+            if success:
+                processing_jobs[job_id]['status'] = 'completed'
+            else:
+                processing_jobs[job_id]['status'] = 'failed'
+                processing_jobs[job_id]['error'] = message
+            
+            # Mark the task as done
+            app.config['PROCESSING_QUEUE'].task_done()
+            
+        except Exception as e:
+            logger.error(f"Worker thread error: {str(e)}")
+            # If we get here, something went wrong with the worker itself
+            if job_id in processing_jobs:
+                processing_jobs[job_id]['status'] = 'failed'
+                processing_jobs[job_id]['error'] = f"Worker thread error: {str(e)}"
+            
+            # Mark the task as done even if it failed
+            app.config['PROCESSING_QUEUE'].task_done()
+
+# Start the worker thread
+worker_thread = Thread(target=process_image_queue, daemon=True)
+worker_thread.start()
 
 # ========== ROUTES ==========
 @app.route('/', methods=['GET', 'POST'])
@@ -476,39 +661,91 @@ def index():
     if request.method == 'POST':
         # Check if image file was uploaded
         if 'image' not in request.files:
-            return redirect(request.url)
+            return render_template_string(INDEX_HTML, css=CSS_STYLE, error="No file selected")
         
         file = request.files['image']
         
         # If user doesn't select a file, browser submits an empty file
         if file.filename == '':
-            return redirect(request.url)
+            return render_template_string(INDEX_HTML, css=CSS_STYLE, error="No file selected")
         
         # Process the image if it exists
         if file:
-            # Secure the filename to prevent directory traversal attacks
-            filename = secure_filename(file.filename)
-            
-            # Define file paths
-            input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            output_path = os.path.join(app.config['PROCESSED_FOLDER'], filename)
-            
-            # Save the uploaded file
-            file.save(input_path)
-            
-            # Get image processing parameters
-            strength = int(request.form.get('strength', 5))
-            method = request.form.get('method', 'nlmeans')
-            grayscale = request.form.get('grayscale') == 'yes'
-            
-            # Process the image
-            denoise_image(input_path, output_path, strength, method, grayscale)
-            
-            # Render the result page
-            return render_template_string(RESULT_HTML, filename=filename, css=CSS_STYLE)
+            try:
+                # Secure the filename to prevent directory traversal attacks
+                filename = secure_filename(file.filename)
+                
+                # Check if the file is an image
+                if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff')):
+                    return render_template_string(INDEX_HTML, css=CSS_STYLE, 
+                                                error="Unsupported file format. Please upload a PNG, JPG, JPEG, GIF, BMP, or TIFF image.")
+                
+                # Define file paths
+                input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                output_path = os.path.join(app.config['PROCESSED_FOLDER'], filename)
+                
+                # Save the uploaded file
+                file.save(input_path)
+                
+                # Get image processing parameters
+                strength = int(request.form.get('strength', 5))
+                method = request.form.get('method', 'nlmeans')
+                grayscale = request.form.get('grayscale') == 'yes'
+                
+                # Create a job ID using timestamp
+                job_id = f"{int(time.time())}_{filename}"
+                
+                # Add job to tracking dictionary
+                processing_jobs[job_id] = {
+                    'status': 'pending',
+                    'filename': filename,
+                    'created_at': time.time()
+                }
+                
+                # Add job to processing queue
+                app.config['PROCESSING_QUEUE'].put((
+                    job_id,
+                    input_path,
+                    output_path,
+                    {
+                        'strength': strength,
+                        'method': method,
+                        'grayscale': grayscale
+                    }
+                ))
+                
+                # Redirect to processing page
+                return render_template_string(PROCESSING_HTML, job_id=job_id, css=CSS_STYLE)
+                
+            except Exception as e:
+                logger.error(f"Error handling upload: {str(e)}")
+                return render_template_string(INDEX_HTML, css=CSS_STYLE, error=f"Error processing upload: {str(e)}")
     
     # Render the index page for GET requests
     return render_template_string(INDEX_HTML, css=CSS_STYLE)
+
+@app.route('/status/<job_id>')
+def check_status(job_id):
+    if job_id not in processing_jobs:
+        return render_template_string(ERROR_HTML, css=CSS_STYLE, 
+                                     error_message="Job not found. It may have expired or been removed.")
+    
+    job = processing_jobs[job_id]
+    
+    # Check the job status
+    if job['status'] == 'pending' or job['status'] == 'processing':
+        # Still processing, show processing page
+        return render_template_string(PROCESSING_HTML, job_id=job_id, css=CSS_STYLE)
+    
+    elif job['status'] == 'completed':
+        # Processing completed, show result page
+        filename = job['filename']
+        return render_template_string(RESULT_HTML, filename=filename, css=CSS_STYLE)
+    
+    else:  # Failed
+        # Processing failed, show error page
+        error_message = job.get('error', 'Unknown error occurred during processing')
+        return render_template_string(ERROR_HTML, css=CSS_STYLE, error_message=error_message)
 
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
@@ -530,8 +767,28 @@ def download_file(filename):
 def health_check():
     return "OK", 200
 
+# Add a cleanup job to remove old processing jobs
+def cleanup_old_jobs():
+    current_time = time.time()
+    to_remove = []
+    
+    for job_id, job in processing_jobs.items():
+        # Remove jobs older than 1 hour
+        if current_time - job['created_at'] > 3600:
+            to_remove.append(job_id)
+    
+    for job_id in to_remove:
+        processing_jobs.pop(job_id, None)
+
+# Cleanup old jobs every 10 minutes
+from apscheduler.schedulers.background import BackgroundScheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=cleanup_old_jobs, trigger="interval", minutes=10)
+scheduler.start()
+
 # Add a port binding that works with Render
 port = int(os.environ.get("PORT", 5000))
 
 if __name__ == '__main__':
+    # Use Gunicorn for production
     app.run(host='0.0.0.0', port=port)
